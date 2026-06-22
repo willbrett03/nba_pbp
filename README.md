@@ -24,9 +24,10 @@ nba-rapm-analysis/
 └── data/
     ├── stints/                 # Stint-level play-by-play input data
     │   └── stints_YYYY_YY.csv  # One file per season (2016-17 to 2024-25)
-    ├── rapm/                   # RAPM model outputs
+    ├── rapm/                   # RAPM model outputs and reference files
     │   ├── rapm_YYYY_YY.csv    # One file per season
-    │   └── game_dates.csv      # Game date reference used by stint_to_rapm.R
+    │   ├── game_dates.csv      # Game date reference used by stint_to_rapm.R
+    │   └── player_names.csv    # Player ID → name lookup used by stint_to_rapm.R
     ├── awards/
     │   ├── awards_mvp_voting.csv
     │   ├── awards_all_nba.csv
@@ -87,7 +88,7 @@ walk(2016:2024, prepare_season_data)
 walk(2016:2024, fit_season_rapm)
 ```
 
-**Input:** `data/stints/stints_YYYY_YY.csv` and `data/rapm/game_dates.csv`  
+**Input:** `data/stints/stints_YYYY_YY.csv`, `data/rapm/game_dates.csv`, and `data/rapm/player_names.csv`  
 **Output:** `data/rapm/rapm_YYYY_YY.csv` (one file per season)
 
 This is the most computationally intensive step. Each season takes a few
