@@ -1,0 +1,217 @@
+---
+title: "Scrape NBA Awards from Basketball Reference"
+format: html
+editor: visual
+---
+
+```{r setup}
+# install.packages("polite")  # uncomment if not yet installed
+library(polite)
+library(rvest)
+library(tidyverse)
+library(janitor)
+library(glue)
+```
+
+## Seasons
+
+We have stint-level data for the 2016–2024 seasons, matching the processed play-by-play RDS files.
+
+```{r seasons}
+seasons <- 2016:2025
+```
+
+## Polite session
+
+`bow()` reads `robots.txt` and respects the declared crawl delay. All subsequent requests go through `nod()` + `scrape()`, which enforces rate-limiting automatically.
+
+```{r session}
+bbref_session <- bow(
+  "https://www.basketball-reference.com",
+  user_agent = "Basketball Research Project (academic use)"
+)
+```
+
+## Scraping helpers
+
+Basketball Reference's award tables (`/awards/awards_{year}.html`) have a two-row header and occasional empty separator rows. We read with `header = FALSE`, promote row 2 to column names, then filter out non-player rows.
+
+Table IDs (confirmed from HTML inspection):
+
+| Award               | Table `id`            |
+|---------------------|-----------------------|
+| MVP voting          | `mvp`                 |
+| All-NBA Teams       | `leading_all_nba`     |
+| All-Defensive Teams | `leading_all_defense` |
+
+```{r helpers}
+# Read a BBRef award table robustly:
+#   - use row 2 as the header (skipping the group-label row)
+#   - drop empty / repeated-header rows
+#   - clean column names with janitor
+parse_bbref_award_table <- function(page, css_id) {
+  node <- page |> html_node(glue("#{css_id}"))
+  if (inherits(node, "xml_missing")) return(NULL)
+
+  raw <- node |> html_table(header = FALSE)
+
+  # Row 2 contains the real column labels
+  col_names <- as.character(raw[2, ])
+  df <- raw[-(1:2), ]            # drop both header rows
+  names(df) <- col_names
+
+  df |>
+    filter(Player != "", Player != "Player") |>  # drop empties & repeated headers
+    clean_names() |>
+    # Keep everything as character so seasons bind cleanly; convert numerics below
+    mutate(across(everything(), as.character))
+}
+```
+
+## Per-season scrape function
+
+```{r scrape_fn}
+scrape_season_awards <- function(year, session) {
+  path <- glue("/awards/awards_{year}.html")
+  page <- nod(session, path) |> scrape(content = "text/html; charset=UTF-8")
+
+  mvp        <- parse_bbref_award_table(page, "mvp")
+  all_nba    <- parse_bbref_award_table(page, "leading_all_nba")
+  all_defense <- parse_bbref_award_table(page, "leading_all_defense")
+
+  list(
+    mvp         = if (!is.null(mvp))         mutate(mvp,         season = as.integer(year), .before = 1),
+    all_nba     = if (!is.null(all_nba))     mutate(all_nba,     season = as.integer(year), .before = 1),
+    all_defense = if (!is.null(all_defense)) mutate(all_defense, season = as.integer(year), .before = 1)
+  )
+}
+```
+
+## Scrape all seasons
+
+`polite` enforces the crawl delay between requests automatically; no extra `Sys.sleep()` needed.
+
+```{r scrape_all}
+awards_list <- map(seasons, function(yr) {
+  message("Scraping ", yr, "...")
+  tryCatch(
+    scrape_season_awards(yr, bbref_session),
+    error = function(e) {
+      warning("Failed for season ", yr, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+})
+
+names(awards_list) <- seasons
+```
+
+## Combine into tidy data frames
+
+```{r combine}
+awards_list <- compact(awards_list)
+
+mvp_voting  <- map_dfr(awards_list, "mvp")
+all_nba     <- map_dfr(awards_list, "all_nba")
+all_defense <- map_dfr(awards_list, "all_defense")
+```
+
+## Convert numeric columns
+
+```{r coerce_numeric}
+# Columns that should be numeric across all three tables
+mvp_num_cols     <- c("rank", "age", "first", "pts_won", "pts_max", "share",
+                       "g", "mp", "pts", "trb", "ast", "stl", "blk",
+                       "fg_percent", "x3p_percent", "ft_percent", "ws", "ws_48")
+all_nba_num_cols <- c("age", "pts_won", "pts_max", "share",
+                       "x1st_tm", "x2nd_tm", "x3rd_tm",
+                       "g", "mp", "pts", "trb", "ast", "stl", "blk",
+                       "fg_percent", "x3p_percent", "ft_percent", "ws", "ws_48")
+def_num_cols     <- c("age", "pts_won", "pts_max", "share",
+                       "g", "mp", "pts", "trb", "ast", "stl", "blk",
+                       "fg_percent", "x3p_percent", "ft_percent",
+                       "ws", "ws_48", "dws", "dbpm", "drtg")
+
+coerce_numeric <- function(df, num_cols) {
+  cols_present <- intersect(num_cols, names(df))
+  df |> mutate(across(all_of(cols_present), ~ suppressWarnings(as.numeric(.x))))
+}
+
+mvp_voting  <- coerce_numeric(mvp_voting,  mvp_num_cols)
+all_nba     <- coerce_numeric(all_nba,     all_nba_num_cols)
+all_defense <- coerce_numeric(all_defense, def_num_cols)
+```
+
+## Clean up key columns
+
+The `number_tm` column encodes the team tier: - All-NBA: `1T` / `2T` / `3T` (teams), `ORV` (other receiving votes) - All-Defensive: `1st` / `2nd`, `ORV`
+
+```{r clean}
+# Rename the team-tier column to something clearer
+all_nba <- all_nba |>
+  rename(team_tier = number_tm) |>
+  mutate(
+    nba_team = case_when(
+      team_tier == "1T"  ~ "1st Team",
+      team_tier == "2T"  ~ "2nd Team",
+      team_tier == "3T"  ~ "3rd Team",
+      team_tier == "ORV" ~ "Other Votes",
+      TRUE               ~ team_tier
+    )
+  )
+
+all_defense <- all_defense |>
+  rename(team_tier = number_tm) |>
+  mutate(
+    defense_team = case_when(
+      team_tier == "1st" ~ "1st Team",
+      team_tier == "2nd" ~ "2nd Team",
+      team_tier == "ORV" ~ "Other Votes",
+      TRUE               ~ team_tier
+    )
+  )
+```
+
+## Inspect
+
+```{r inspect}
+# ── MVP winners ──────────────────────────────────────────────────────────────
+cat("=== MVP Winners by Season ===\n")
+mvp_voting |>
+  filter(rank == 1) |>
+  select(season, player, tm, first, pts_won, pts_max, share) |>
+  print(n = Inf)
+
+# ── All-NBA 1st Team ─────────────────────────────────────────────────────────
+cat("\n=== All-NBA 1st Team by Season ===\n")
+all_nba |>
+  filter(nba_team == "1st Team") |>
+  select(season, pos, player, tm) |>
+  arrange(season, pos) |>
+  print(n = Inf)
+
+# ── All-Defensive 1st Team ───────────────────────────────────────────────────
+cat("\n=== All-Defensive 1st Team by Season ===\n")
+all_defense |>
+  filter(defense_team == "1st Team") |>
+  select(season, pos, player, tm) |>
+  arrange(season, pos) |>
+  print(n = Inf)
+```
+
+## Save outputs
+
+```{r save}
+output_dir <- "/Users/willbrett/Documents/Basketball Project"
+
+write_csv(mvp_voting,  file.path(output_dir, "awards_mvp_voting.csv"))
+write_csv(all_nba,     file.path(output_dir, "awards_all_nba.csv"))
+write_csv(all_defense, file.path(output_dir, "awards_all_defense.csv"))
+
+message(
+  "Saved:\n",
+  "  awards_mvp_voting.csv  (", nrow(mvp_voting),  " rows)\n",
+  "  awards_all_nba.csv     (", nrow(all_nba),     " rows)\n",
+  "  awards_all_defense.csv (", nrow(all_defense), " rows)"
+)
+```

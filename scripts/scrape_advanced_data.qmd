@@ -1,0 +1,143 @@
+---
+title: "Scrape NBA Advanced Stats by Team"
+format: html
+editor: visual
+---
+
+```{r setup}
+# install.packages("polite")  # uncomment if needed
+library(polite)
+library(rvest)
+library(tidyverse)
+library(janitor)
+library(glue)
+```
+
+## Overview
+
+Scrapes the **Advanced** stats table from each NBA team page on Basketball Reference (`/teams/{TEAM}/{YEAR}.html`) for every season we have other scraped data for (2016–2025, where the year is the final year of the season — e.g. 2024 = 2023-24).
+
+**Columns extracted:** Player, Age, Pos, G, MP, PER, OWS, DWS, WS, OBPM, DBPM, BPM, VORP.
+
+> **Note:** Stats are per team stint. A player traded mid-season will appear once per team they played for, not as a single combined row. The `team` column identifies which stint each row belongs to. Deduplicate or sum as needed for full-season totals.
+
+This makes **300 requests** (30 teams × 10 seasons). With Basketball Reference's 3-second crawl delay, expect \~15 minutes of run time.
+
+------------------------------------------------------------------------
+
+## Configuration
+
+```{r config}
+# Seasons to scrape: year = final year of the season (2024 = 2023-24)
+seasons <- 2016:2025
+
+# All 30 NBA team abbreviations (stable since 2016)
+nba_teams <- c(
+  "ATL", "BOS", "BRK", "CHO", "CHI", "CLE", "DAL", "DEN", "DET", "GSW",
+  "HOU", "IND", "LAC", "LAL", "MEM", "MIA", "MIL", "MIN", "NOP", "NYK",
+  "OKC", "ORL", "PHI", "PHO", "POR", "SAC", "SAS", "TOR", "UTA", "WAS"
+)
+
+# Columns to keep from the advanced table (exact BBRef names)
+KEEP_COLS <- c("Player", "Age", "Pos", "G", "MP",
+               "PER", "OWS", "DWS", "WS", "OBPM", "DBPM", "BPM", "VORP")
+
+OUTPUT_PATH <- "/Users/willbrett/Documents/Basketball Project/advanced_stats.csv"
+```
+
+## Polite session
+
+```{r session}
+bbref_session <- bow(
+  "https://www.basketball-reference.com",
+  user_agent = "Basketball Research Project (academic use)"
+)
+```
+
+## Parsing helper
+
+BBRef wraps many tables in HTML comments. We strip those before parsing, then use the first row as column names and filter out non-player rows.
+
+```{r helper}
+parse_advanced_table <- function(page, team, year) {
+  # Strip HTML comments so buried tables become visible
+  page_text <- gsub("<!--|-->", "", as.character(page))
+  page2     <- read_html(page_text)
+
+  node <- page2 |> html_node("#advanced")
+  if (inherits(node, "xml_missing")) return(NULL)
+
+  raw      <- node |> html_table(header = FALSE)
+  col_names <- as.character(raw[1, ])   # row 1 is the real header
+  df        <- raw[-1, ]
+  names(df) <- col_names
+
+  df |>
+    filter(
+      Player != "Player",   # drop repeated header rows
+      Player != "",
+      !str_detect(Player, "^Team|^League")  # drop totals rows
+    ) |>
+    select(any_of(KEEP_COLS)) |>
+    mutate(
+      team   = team,
+      season = year,
+      .before = 1
+    ) |>
+    mutate(across(any_of(c("Age","G","MP","PER","OWS","DWS","WS",
+                            "OBPM","DBPM","BPM","VORP")),
+                  ~ suppressWarnings(as.numeric(.x))))
+}
+```
+
+## Scrape all teams and seasons
+
+```{r scrape}
+all_advanced <- map_dfr(seasons, function(yr) {
+  message("\n── Season ", yr, " ─────────────────────────────────────")
+
+  map_dfr(nba_teams, function(tm) {
+    path   <- glue("/teams/{tm}/{yr}.html")
+    result <- tryCatch({
+      page <- nod(bbref_session, path) |>
+        scrape(content = "text/html; charset=UTF-8")
+      parse_advanced_table(page, tm, yr)
+    }, error = function(e) {
+      warning(tm, "/", yr, ": ", conditionMessage(e))
+      NULL
+    })
+
+    if (!is.null(result)) {
+      message("  ", tm, " — ", nrow(result), " players")
+    }
+    result
+  })
+})
+
+message("\nDone. Total rows: ", nrow(all_advanced))
+```
+
+## Inspect
+
+```{r inspect}
+glimpse(all_advanced)
+
+# Season coverage
+all_advanced |>
+  count(season, name = "player_rows") |>
+  print()
+
+# Quick sanity check: top PER players in 2024
+all_advanced |>
+  filter(season == 2024) |>
+  slice_max(PER, n = 10) |>
+  select(season, team, Player, Pos, G, PER, WS, BPM, VORP) |>
+  print()
+```
+
+## Save
+
+```{r save}
+write_csv(all_advanced, OUTPUT_PATH)
+message("Saved ", nrow(all_advanced), " rows to advanced_stats.csv")
+```

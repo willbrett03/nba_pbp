@@ -1,0 +1,83 @@
+---
+title: "Backup nbarapm.com API Data"
+format: html
+---
+
+## Overview
+
+This document fetches the complete raw response from each of the four
+nbarapm.com JSON endpoints and saves them as CSV files in the
+`nbarapm_backup/` folder.
+
+Run this periodically (or whenever you update the main app data) to keep a
+local snapshot in case the API becomes unavailable or requires authentication.
+Each run overwrites the previous backup.
+
+The backup files are **unfiltered and unmodified** — every column and every
+season that the API returns is preserved so nothing is lost.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(jsonlite)
+
+BACKUP_DIR <- file.path(dirname(rstudioapi::getSourceEditorContext()$path),
+                        "nbarapm_backup")
+dir.create(BACKUP_DIR, showWarnings = FALSE)
+```
+
+```{r helpers}
+fetch_and_save <- function(url, filename_base) {
+  cat("Fetching", url, "...\n")
+  tryCatch({
+    raw <- fromJSON(url, simplifyDataFrame = TRUE) |> as_tibble()
+    cat("  -> ", nrow(raw), "rows,", ncol(raw), "columns\n")
+
+    # Normalise hyphenated column names for CSV safety (O-MAMBA -> O_MAMBA)
+    raw <- raw |> rename_with(~ str_replace_all(.x, "-", "_"))
+
+    out_path <- file.path(BACKUP_DIR, paste0(filename_base, ".csv"))
+    write_csv(raw, out_path)
+    cat("  Saved:", out_path, "\n\n")
+
+    raw
+  }, error = function(e) {
+    warning("Failed to fetch ", url, ": ", conditionMessage(e))
+    NULL
+  })
+}
+```
+
+```{r fetch-mamba}
+mamba_raw <- fetch_and_save("https://www.nbarapm.com/load/mamba",  "mamba")
+```
+
+```{r fetch-raptor}
+raptor_raw <- fetch_and_save("https://www.nbarapm.com/load/raptor", "raptor")
+```
+
+```{r fetch-darko}
+darko_raw <- fetch_and_save("https://www.nbarapm.com/load/DARKO",  "darko")
+```
+
+```{r fetch-lebron}
+lebron_raw <- fetch_and_save("https://www.nbarapm.com/load/lebron", "lebron")
+```
+
+```{r summary}
+datasets <- list(MAMBA = mamba_raw, RAPTOR = raptor_raw,
+                 DARKO = darko_raw, LEBRON = lebron_raw)
+
+cat("=== Backup summary ===\n")
+for (nm in names(datasets)) {
+  d <- datasets[[nm]]
+  if (is.null(d)) {
+    cat(nm, ": FAILED\n")
+  } else {
+    yr_col <- if ("year" %in% names(d)) "year" else "season"
+    yr_range <- paste(range(d[[yr_col]], na.rm = TRUE), collapse = " - ")
+    cat(nm, ":", nrow(d), "rows |", ncol(d), "cols | years", yr_range, "\n")
+  }
+}
+
+cat("\nFiles written to:", normalizePath(BACKUP_DIR), "\n")
+```

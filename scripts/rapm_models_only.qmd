@@ -1,0 +1,670 @@
+---
+title: "RAPM Models"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(hoopR)
+library(janitor)
+library(future)
+library(zoo)
+library(Matrix)
+library(glmnet)
+```
+
+## Adjusted (from Dhakshin)
+
+```{r }
+##################
+pbp_final_gt <- readRDS("/Users/willbrett/Documents/Basketball Project/play_by_play_processed_2022.rds")
+test <- pbp_final_gt %>%
+  group_by(game_id, slug_team) %>%
+  mutate(stint_home = ifelse(slug_team == team_home, cumsum(msg_type == 8) + 1, NA),
+         stint_away = ifelse(slug_team == team_away, cumsum(msg_type == 8) + 1, NA)) %>% #keep track of each time subs are made leading to a different 5 player stint
+  group_by(game_id) %>%
+  mutate(across(starts_with("stint"), ~ na.locf0(., fromLast = TRUE)),
+         across(starts_with("stint"), ~ na.locf(.))) %>%
+  ungroup() %>% #keep track of which stint is on the floor
+  pivot_longer(cols = starts_with("lineup"),
+               names_to = "lineup_location",
+               values_to = "lineup",
+               names_prefix = "lineup_") %>%
+  mutate(pts_team = ifelse(lineup_location == "home", shot_pts_home, shot_pts_away),
+         pts_opp = ifelse(lineup_location == "away", shot_pts_home, shot_pts_away),
+         poss_team = ifelse(lineup_location == "home", poss_home, poss_away),
+         poss_opp = ifelse(lineup_location == "away", poss_home, poss_away),
+         slug_team = ifelse(lineup_location == "home", team_home, team_away),
+         slug_opp = ifelse(lineup_location == "away", team_home, team_away),
+         stint = ifelse(lineup_location == "home", stint_home, stint_away)) %>% 
+  select(game_id, game_date, period, stint, number_event, msg_type, description, lineup, pts_team, pts_opp,
+         poss_team, poss_opp, secs_played, slug_team, slug_opp, garbage_time)
+
+LineupIDs = data.frame("Lineups" = unique(test$lineup), "LineupID" = seq(1:length(unique(test$lineup))))
+
+df.home = test[seq(1, nrow(test), 2), ] %>% 
+  rename('Lineup_home' = 'lineup')
+df.away = test[seq(2, nrow(test), 2), ] %>% 
+  rename('Lineup_away' = 'lineup')
+
+lineups_home_perspective <- df.home %>% 
+  left_join(df.away %>% select(game_id, number_event, Lineup_away, secs_played)) %>% 
+  group_by(game_id, game_date, period, stint, slug_team, slug_opp, Lineup_home, Lineup_away, garbage_time) %>%
+  summarise(across(c(pts_team, pts_opp, poss_team, poss_opp, secs_played), sum)) %>%
+  ungroup() %>% #accumulate stats by stint
+  filter(secs_played + poss_opp + poss_team + pts_opp + pts_team > 0) %>%
+  #remove stints where no event occurs (check if we can move stints with 0 secs to prev stint)
+  group_by(game_id, slug_team) %>%
+  mutate(stint = row_number()) %>%
+  ungroup() %>% 
+  mutate(zero_secs = ifelse(slug_team == lag(slug_team) & secs_played == 0, TRUE, FALSE),
+         pts_team = pts_team + ifelse(lead(zero_secs), lead(pts_team), 0),
+         pts_opp = pts_opp + ifelse(lead(zero_secs), lead(pts_opp), 0),
+         poss_team = poss_team + ifelse(lead(zero_secs), lead(poss_team), 0),
+         poss_opp = poss_opp + ifelse(lead(zero_secs), lead(poss_opp), 0)) %>% 
+  filter(secs_played != 0) %>% 
+  left_join(LineupIDs, by = c("Lineup_home" = "Lineups"))
+
+
+lineups_away_perspective <- df.away %>% 
+  left_join(df.home %>% select(game_id, number_event, Lineup_home, secs_played)) %>% 
+  group_by(game_id, game_date, period, stint, slug_team, slug_opp, Lineup_home, Lineup_away, garbage_time) %>%
+  summarise(across(c(pts_team, pts_opp, poss_team, poss_opp, secs_played), sum)) %>%
+  ungroup() %>% #accumulate stats by stint
+  filter(secs_played + poss_opp + poss_team + pts_opp + pts_team > 0) %>%
+  #remove stints where no event occurs (check if we can move stints with 0 secs to prev stint)
+  group_by(game_id, slug_team) %>%
+  mutate(stint = row_number()) %>%
+  ungroup() %>% 
+  mutate(zero_secs = ifelse(slug_team == lag(slug_team) & secs_played == 0, TRUE, FALSE),
+         pts_team = pts_team + ifelse(lead(zero_secs), lead(pts_team), 0),
+         pts_opp = pts_opp + ifelse(lead(zero_secs), lead(pts_opp), 0),
+         poss_team = poss_team + ifelse(lead(zero_secs), lead(poss_team), 0),
+         poss_opp = poss_opp + ifelse(lead(zero_secs), lead(poss_opp), 0)) %>% 
+  filter(secs_played != 0) %>% 
+  relocate('Lineup_home', .after = 'Lineup_away') %>% 
+  left_join(LineupIDs, by = c("Lineup_away" = "Lineups"))
+
+avgs_home <- lineups_home_perspective %>% 
+  group_by(game_id, Lineup_home, LineupID) %>% 
+  summarize(points_scored = sum(pts_team),
+            points_allowed = sum(pts_opp),
+            possessions_for = sum(poss_team),
+            possessions_against = sum(poss_opp),
+            secs = sum(secs_played)) %>% 
+  mutate(ORTG = points_scored * (100/possessions_for),
+         DRTG = points_allowed * (100/possessions_against)) %>% 
+  filter(!is.infinite(ORTG) & !is.na(ORTG))%>% 
+  filter(!is.infinite(DRTG) & !is.na(DRTG))
+
+avgs_away <- lineups_away_perspective %>% 
+  group_by(game_id, Lineup_away, LineupID) %>% 
+  summarize(points_scored = sum(pts_team),
+            points_allowed = sum(pts_opp),
+            possessions_for = sum(poss_team),
+            possessions_against = sum(poss_opp),
+            secs = sum(secs_played)) %>% 
+  mutate(ORTG = points_scored * (100/possessions_for),
+         DRTG = points_allowed * (100/possessions_against))%>% 
+  filter(!is.infinite(ORTG) & !is.na(ORTG))%>% 
+  filter(!is.infinite(DRTG) & !is.na(DRTG))
+
+all_avgs <- rbind(avgs_home %>% rename("lineup" = 'Lineup_home'), 
+                  avgs_away %>% rename("lineup" = 'Lineup_away')) %>% 
+  arrange(game_id) %>% 
+  group_by(lineup) %>% 
+  mutate(ORTG_MA = cummean(ORTG), #cumsum for possessions and points scored
+         DRTG_MA = cummean(DRTG),
+         ORTG_RA = lag(ORTG_MA),
+         DRTG_RA = lag(DRTG_MA),
+         game_number = n()) %>% 
+  ungroup()
+
+combined_lineups <- rbind(lineups_home_perspective %>% 
+  rename('Lineup_team' = 'Lineup_home',
+         'Lineup_opp' = 'Lineup_away',
+         'LineupID_team' = 'LineupID'),
+  lineups_away_perspective%>% 
+    rename('Lineup_team' = 'Lineup_away',
+           'Lineup_opp' = 'Lineup_home',
+           'LineupID_team' = 'LineupID')) %>% 
+  left_join(LineupIDs, by = c('Lineup_opp' = 'Lineups')) %>% 
+  rename('LineupID_opp' = 'LineupID') %>% 
+  left_join(all_avgs %>% select(game_id, LineupID, ORTG_RA, DRTG_RA),
+            by = join_by(game_id == game_id,  LineupID_team == LineupID )) %>% 
+  rename('ORTG_RA_team' = 'ORTG_RA',
+         'DRTG_RA_team' = 'DRTG_RA') %>% 
+  left_join(all_avgs %>% select(game_id, LineupID, ORTG_RA, DRTG_RA),
+            by = join_by(game_id == game_id,  LineupID_opp == LineupID )) %>% 
+  rename('ORTG_RA_opp' = 'ORTG_RA',
+         'DRTG_RA_opp' = 'DRTG_RA') %>% 
+  select(game_id:Lineup_team, LineupID_team, ORTG_RA_team:DRTG_RA_team, 
+         Lineup_opp, LineupID_opp, ORTG_RA_opp:DRTG_RA_opp,
+         garbage_time:zero_secs) %>%
+  filter(str_count(Lineup_team, ",") == 4,
+         str_count(Lineup_opp,  ",") == 4) %>%
+  separate_wider_delim(cols = Lineup_team, delim = ',',
+                       names = c('P1', 'P2', 'P3', 'P4', 'P5')) %>% 
+  separate_wider_delim(cols = Lineup_opp, delim = ',',
+                       names = c('DP1', 'DP2', 'DP3', 'DP4', 'DP5')) %>% 
+  mutate(across(P1:P5, str_trim)) %>% 
+  mutate(across(DP1:DP5, str_trim)) %>% 
+  mutate(ORTG = (100/poss_team)*pts_team,
+         DRTG = (100/poss_opp)*pts_opp,
+         netrt = ORTG - DRTG) %>% 
+  filter(!is.na(netrt)) %>% 
+  filter(!is.infinite(netrt)) %>% 
+  filter(!is.na(ORTG_RA_opp) & !is.na(ORTG_RA_team) &
+         !is.na(DRTG_RA_opp) & !is.na(DRTG_RA_team))#checck
+
+# combined_lineups2 <- combined_lineups %>% rename(ORTG = DRTG, DRTG = ORTG, ORTG_RA_team = ORTG_RA_opp, ORTG_RA_opp = ORTG_RA_team, DRTG_RA_team = DRTG_RA_opp, DRTG_RA_opp = DRTG_RA_team) #Flip perspective for opp team
+
+
+
+set.seed(1)
+#combined_lineups <- combined_lineups %>% slice_sample(n = 10, by = game_id)
+
+unique_players <- unique(c(combined_lineups$P1, combined_lineups$P2,
+                           combined_lineups$P3, combined_lineups$P4, 
+                           combined_lineups$P5, combined_lineups$DP1,
+                           combined_lineups$DP2, combined_lineups$DP3,
+                           combined_lineups$DP4, combined_lineups$DP5))
+
+player_matrices <- function(current_lineup, all_players){
+  x <- rep(0, length(all_players))
+  x[which(all_players==current_lineup[1])] = 1
+  x[which(all_players==current_lineup[2])] = 1
+  x[which(all_players==current_lineup[3])] = 1
+  x[which(all_players==current_lineup[4])] = 1
+  x[which(all_players==current_lineup[5])] = 1
+  # x[which(all_players==current_lineup[6])] = -1
+  # x[which(all_players==current_lineup[7])] = -1
+  # x[which(all_players==current_lineup[8])] = -1
+  # x[which(all_players==current_lineup[9])] = -1
+  # x[which(all_players==current_lineup[10])] = -1
+  return(x)
+}
+x <- nrow(combined_lineups)
+
+#firstdf <- combined_lineups[(x/2+1):x , ]
+
+sample <- t(apply(combined_lineups %>% select(P1:P5), 1, function(x){player_matrices(x, unique_players)}))
+sample <- as(as.matrix(sample), 'dgCMatrix')
+sample <- cbind(sample, combined_lineups$ORTG_RA_team, combined_lineups$DRTG_RA_opp)
+
+
+penalties <- c(rep(1,ncol(sample)-2), c(rep(1,2)))
+
+
+
+trial1 <- cv.glmnet(sample, combined_lineups$ORTG, alpha = 0, nfolds = 10, standardize = FALSE, penalty.factor = penalties)
+model_w_coeff <- glmnet(sample, combined_lineups$ORTG, alpha = 0, standardize = FALSE, lambda = trial1$lambda.min, penalty.factor = penalties)
+ORapm <- model_w_coeff$beta
+ORapm <- as.matrix(ORapm)
+unique_players <- append(unique_players, c('ORTG_RA_team', 'DRTG_RA_opp'))
+Ofinal <- data.frame("Player Name" = unique_players, "ORAPM" = ORapm)
+Ofinal$rank <- dense_rank(desc(Ofinal$s0))
+ifelse(ORapm[503] != 0, 1, 0)
+
+
+unique_players <- unique(c(combined_lineups$P1, combined_lineups$P2,
+                           combined_lineups$P3, combined_lineups$P4, 
+                           combined_lineups$P5, combined_lineups$DP1,
+                           combined_lineups$DP2, combined_lineups$DP3,
+                           combined_lineups$DP4, combined_lineups$DP5))
+
+player_matrices <- function(current_lineup, all_players){
+  x <- rep(0, length(all_players))
+  x[which(all_players==current_lineup[1])] = -1
+  x[which(all_players==current_lineup[2])] = -1
+  x[which(all_players==current_lineup[3])] = -1
+  x[which(all_players==current_lineup[4])] = -1
+  x[which(all_players==current_lineup[5])] = -1
+  # x[which(all_players==current_lineup[6])] = -1
+  # x[which(all_players==current_lineup[7])] = -1
+  # x[which(all_players==current_lineup[8])] = -1
+  # x[which(all_players==current_lineup[9])] = -1
+  # x[which(all_players==current_lineup[10])] = -1
+  return(x)
+}
+
+sample <- t(apply(combined_lineups %>% select(P1:P5), 1, function(x){player_matrices(x, unique_players)}))
+sample <- as(as.matrix(sample), 'dgCMatrix')
+sample <- cbind(sample, combined_lineups$ORTG_RA_opp, combined_lineups$DRTG_RA_team)
+
+# sample2 <- t(apply(combined_lineups2 %>% select(DP1:DP5), 1, function(x){player_matrices(x, unique_players)}))
+# sample2 <- as(as.matrix(sample), 'dgCMatrix')
+# sample2 <- cbind(sample, combined_lineups$ORTG_RA_team, combined_lineups$DRTG_RA_opp)
+
+# sample <- rbind(sample1, sample2)
+
+penalties <- c(rep(1,ncol(sample)-2), c(rep(1,2)))
+
+# lineups_both_persp <- rbind(combined_lineups, combined_lineups2)
+
+trial1 <- cv.glmnet(sample, combined_lineups$DRTG, alpha = 0, nfolds = 10, standardize = FALSE, penalty.factor = penalties)
+model_w_coeff <- glmnet(sample, combined_lineups$DRTG, alpha = 0, standardize = FALSE, lambda = trial1$lambda.min, penalty.factor = penalties)
+DRapm <- model_w_coeff$beta
+DRapm <- as.matrix(DRapm)
+unique_players <- append(unique_players, c('ORTG_RA_opp', 'DRTG_RA_team'))
+Dfinal <- data.frame("Player Name" = unique_players, "DRAPM" = DRapm)
+Dfinal$rank <- dense_rank(desc(Dfinal$s0))
+ifelse(DRapm[503] != 0, 1, 0)
+
+
+
+Rapm <- Ofinal %>% 
+  full_join(Dfinal, by = join_by(Player.Name)) %>% 
+  rename( ORAPM = s0.x , O_rank = rank.x, DRAPM = s0.y , D_rank = rank.y )
+
+saveRDS(Rapm, "~/Documents/Basketball Project/normal_rapm_22.rds")
+
+```
+
+```{r}
+#We don't have adjusted_rapm.rds yet
+newrapm <- readRDS("adjusted_rapm.rds")
+oldrapm <- readRDS("normal_rapm.rds")
+
+x <- oldrapm %>% 
+  left_join(newrapm, by = "Player.Name") %>% 
+  mutate(O_diff = O_rank.x - O_rank.y,
+         D_diff = D_rank.x - D_rank.y)
+
+
+
+```
+
+```{r}
+# sample2 <- t(apply(combined_lineups2 %>% select(DP1:DP5), 1, function(x){player_matrices(x, unique_players)}))
+# sample2 <- as(as.matrix(sample), 'dgCMatrix')
+# sample2 <- cbind(sample, combined_lineups$ORTG_RA_team, combined_lineups$DRTG_RA_opp)
+
+# sample <- rbind(sample1, sample2)
+# lineups_both_persp <- rbind(combined_lineups, combined_lineups2)
+```
+
+```{r}
+poss_play <- combined_lineups %>% group_by(LineupID_team) %>% 
+  summarise(poss_total = sum(poss_team+poss_opp),
+            secs = sum(secs_played)) 
+
+ggplot(poss_play %>% filter(poss_total >= 100))+
+  geom_histogram(aes(poss_total))
+
+dim(poss_play %>% filter(poss_total >= 100))
+
+#season averages, player average minutes
+
+p1 <- combined_lineups %>% 
+  group_by(P1) %>% 
+  summarize(secs = sum(secs_played)) %>% 
+  rename(Player = P1)
+p2 <- combined_lineups %>% 
+  group_by(P2) %>% 
+  summarize(secs = sum(secs_played)) %>% 
+  rename(Player = P2)
+p3 <- combined_lineups %>% 
+  group_by(P3) %>% 
+  summarize(secs = sum(secs_played)) %>% 
+  rename(Player = P3)
+p4 <- combined_lineups %>% 
+  group_by(P4) %>% 
+  summarize(secs = sum(secs_played)) %>% 
+  rename(Player = P4)
+p5 <- combined_lineups %>% 
+  group_by(P5) %>% 
+  summarize(secs = sum(secs_played)) %>% 
+  rename(Player = P5)
+
+players <- p1 %>% 
+  full_join(p2, by = 'Player') %>% 
+  full_join(p3, by = 'Player') %>% 
+  full_join(p4, by = 'Player') %>% 
+  full_join(p5, by = 'Player') %>% 
+  replace(is.na(.), 0) %>% 
+  mutate(mins_played = (secs + secs.x + secs.y + secs.x.x + secs.y.y)/60) %>% 
+  select(Player, mins_played) %>% 
+  filter(mins_played > 1000) # minutes per game played - 12mpg
+
+player_list <- players$Player
+
+combined_lineups_2 <- combined_lineups %>% 
+  mutate(P1_ind = ifelse(P1 %in% player_list, 1 ,0),
+         P2_ind = ifelse(P2 %in% player_list, 1 ,0),
+         P3_ind = ifelse(P3 %in% player_list, 1 ,0),
+         P4_ind = ifelse(P4 %in% player_list, 1 ,0),
+         P5_ind = ifelse(P5 %in% player_list, 1 ,0),
+         num_players = P1_ind + P2_ind + P3_ind + P4_ind + P5_ind) %>% 
+  filter(num_players >= 3)
+  
+compare_RAPM <- final_full %>% 
+  left_join(final_half, by = 'Player.Name') %>% 
+  rename(RAPM_half = s0.y,
+         rank_half = rank.y,
+         RAPM_full = s0.x,
+         rank_full = rank.x) %>% 
+  mutate(diff = RAPM_full - RAPM_half,
+         rank_diff = rank_full - rank_half)
+
+```
+
+### adjusted1 show results
+
+```{r}
+rapm_results <- readRDS("normal_rapm_22.rds")
+
+rapm_results %>% 
+  arrange(O_rank) %>% 
+  head(10)
+
+rapm_results %>% 
+  arrange(D_rank) %>% 
+  head(10)
+```
+
+## Normal (no adjustments)
+
+```{r}
+# Assumes lineups_home_perspective, lineups_away_perspective, and LineupIDs
+# already loaded in from above.
+
+# Key differences from the Adjusted (from Dhakshin) model:
+#   1. removed all of the cumulative average calcs
+#   2. combined_lineups_normal doesnt have RA cols
+#   3. removed RA NA filter 
+#   4. The design matrix has no RA covariate columns appended.
+
+combined_lineups_normal <- rbind(
+  lineups_home_perspective %>%
+    rename('Lineup_team' = 'Lineup_home',
+           'Lineup_opp'  = 'Lineup_away',
+           'LineupID_team' = 'LineupID'),
+  lineups_away_perspective %>%
+    rename('Lineup_team' = 'Lineup_away',
+           'Lineup_opp'  = 'Lineup_home',
+           'LineupID_team' = 'LineupID')) %>%
+  left_join(LineupIDs, by = c('Lineup_opp' = 'Lineups')) %>%
+  rename('LineupID_opp' = 'LineupID') %>%
+  # had to add this in bc RA NA filter was removed, so it was accidentally keeping in some rows where there were not 5 players
+  filter(str_count(Lineup_team, ",") == 4,
+         str_count(Lineup_opp,  ",") == 4) %>%
+  separate_wider_delim(cols = Lineup_team, delim = ',',
+                       names = c('P1', 'P2', 'P3', 'P4', 'P5')) %>%
+  separate_wider_delim(cols = Lineup_opp, delim = ',',
+                       names = c('DP1', 'DP2', 'DP3', 'DP4', 'DP5')) %>%
+  mutate(across(P1:P5, str_trim)) %>%
+  mutate(across(DP1:DP5, str_trim)) %>%
+  mutate(ORTG   = (100 / poss_team) * pts_team,
+         DRTG   = (100 / poss_opp)  * pts_opp,
+         netrt  = ORTG - DRTG) %>%
+  filter(!is.na(netrt), !is.infinite(netrt))
+
+set.seed(1)
+
+unique_players_normal <- unique(c(combined_lineups_normal$P1,  combined_lineups_normal$P2,
+                                  combined_lineups_normal$P3,  combined_lineups_normal$P4,
+                                  combined_lineups_normal$P5,  combined_lineups_normal$DP1,
+                                  combined_lineups_normal$DP2, combined_lineups_normal$DP3,
+                                  combined_lineups_normal$DP4, combined_lineups_normal$DP5))
+
+# --- Offensive RAPM ---
+
+player_matrices_off <- function(current_lineup, all_players) {
+  x <- rep(0, length(all_players))
+  x[which(all_players == current_lineup[1])] <- 1
+  x[which(all_players == current_lineup[2])] <- 1
+  x[which(all_players == current_lineup[3])] <- 1
+  x[which(all_players == current_lineup[4])] <- 1
+  x[which(all_players == current_lineup[5])] <- 1
+  return(x)
+}
+
+sample_O <- t(apply(combined_lineups_normal %>% select(P1:P5), 1,
+                    function(x) player_matrices_off(x, unique_players_normal)))
+sample_O <- as(as.matrix(sample_O), 'dgCMatrix')
+
+penalties_O <- rep(1, ncol(sample_O))
+
+trial_O  <- cv.glmnet(sample_O, combined_lineups_normal$ORTG,
+                      alpha = 0, nfolds = 10, standardize = FALSE,
+                      penalty.factor = penalties_O)
+model_O  <- glmnet(sample_O, combined_lineups_normal$ORTG,
+                   alpha = 0, standardize = FALSE,
+                   lambda = trial_O$lambda.min, penalty.factor = penalties_O)
+
+ORapm_normal <- as.matrix(model_O$beta)
+Ofinal_normal <- data.frame("Player Name" = unique_players_normal, "ORAPM" = ORapm_normal)
+Ofinal_normal$rank <- dense_rank(desc(Ofinal_normal$s0))
+
+# --- Defensive RAPM ---
+
+unique_players_normal <- unique(c(combined_lineups_normal$P1,  combined_lineups_normal$P2,
+                                  combined_lineups_normal$P3,  combined_lineups_normal$P4,
+                                  combined_lineups_normal$P5,  combined_lineups_normal$DP1,
+                                  combined_lineups_normal$DP2, combined_lineups_normal$DP3,
+                                  combined_lineups_normal$DP4, combined_lineups_normal$DP5))
+
+player_matrices_def <- function(current_lineup, all_players) {
+  x <- rep(0, length(all_players))
+  x[which(all_players == current_lineup[1])] <- -1
+  x[which(all_players == current_lineup[2])] <- -1
+  x[which(all_players == current_lineup[3])] <- -1
+  x[which(all_players == current_lineup[4])] <- -1
+  x[which(all_players == current_lineup[5])] <- -1
+  return(x)
+}
+
+sample_D <- t(apply(combined_lineups_normal %>% select(P1:P5), 1,
+                    function(x) player_matrices_def(x, unique_players_normal)))
+sample_D <- as(as.matrix(sample_D), 'dgCMatrix')
+
+penalties_D <- rep(1, ncol(sample_D))
+
+trial_D  <- cv.glmnet(sample_D, combined_lineups_normal$DRTG,
+                      alpha = 0, nfolds = 10, standardize = FALSE,
+                      penalty.factor = penalties_D)
+model_D  <- glmnet(sample_D, combined_lineups_normal$DRTG,
+                   alpha = 0, standardize = FALSE,
+                   lambda = trial_D$lambda.min, penalty.factor = penalties_D)
+
+DRapm_normal <- as.matrix(model_D$beta)
+Dfinal_normal <- data.frame("Player Name" = unique_players_normal, "DRAPM" = DRapm_normal)
+Dfinal_normal$rank <- dense_rank(desc(Dfinal_normal$s0))
+
+# --- Combine and save ---
+
+Rapm_normal <- Ofinal_normal %>%
+  full_join(Dfinal_normal, by = join_by(Player.Name)) %>%
+  rename(ORAPM = s0.x, O_rank = rank.x, DRAPM = s0.y, D_rank = rank.y) %>% 
+  mutate(RAPM = ORAPM + DRAPM, RAPM_rank = dense_rank(desc(RAPM)))
+
+saveRDS(Rapm_normal, "new_normal_rapm_22.rds")
+```
+
+### normal show results
+
+```{r}
+rapm_results <- readRDS("new_normal_rapm_22.rds")
+
+rapm_results %>% 
+  arrange(O_rank) %>% 
+  head(10)
+
+rapm_results %>% 
+  arrange(D_rank) %>% 
+  head(10)
+
+rapm_results %>% 
+  arrange(RAPM_rank) %>% 
+  head(10)
+```
+
+## Adjusted (updated)
+
+```{r}
+# Assumes lineups_home_perspective, lineups_away_perspective, LineupIDs, and all_avgs
+# are already in the environment from the Adjusted (from Dhakshin) section above.
+#
+# Changes from Adjusted (from Dhakshin):
+#   1. Single net rating model: team players encoded as +1 and opponent players as -1
+#      in one combined design matrix. Response is netrt, not separate ORTG/DRTG models.
+#      All four RA covariates (team and opp, offensive and defensive) are included since
+#      all four are relevant adjustments for net rating.
+#   2. Possession weighting: each stint weighted by harmonic mean of poss_team and poss_opp.
+#
+# Change 3 (penalty = 0 for RA covariates) was tested and reverted. Setting the RA
+# covariate penalty to 0 caused over-adjustment: the unpenalized covariates absorbed
+# systematic variance correlated with team quality, inflating coefficients for role
+# players on weaker teams. RA covariates remain at penalty = 1 for now.
+#
+# Potential future changes (not yet implemented):
+#   [TODO - Change 4] all_avgs currently uses cummean() which weights all past games equally.
+#      An exponentially weighted moving average (EWMA) would give more recent games higher
+#      weight: e.g. accumulate(ORTG, ~ alpha * .y + (1 - alpha) * .x) for some decay alpha.
+#
+#   [TODO - Change 5] Consider lambda.1se instead of lambda.min. lambda.min minimises CV
+#      error; lambda.1se is the largest lambda within one standard error of the minimum,
+#      producing a more aggressively shrunk model. For RAPM rankings (vs raw prediction),
+#      lambda.1se tends to be more stable across seasons.
+#
+#   [TODO - Change 6] Assign CV folds at the game level to prevent data leakage. Stints
+#      from the same game are not independent, so random stint-level assignment lets the
+#      model see partial game information in training and evaluate on the rest.
+#      Implementation: foldid <- as.integer(factor(combined_lineups_adj$game_id)) %% 10 + 1
+#      then pass foldid = foldid to cv.glmnet instead of nfolds = 10.
+#
+#   [TODO - Change 7] standardize = FALSE is correct for player columns (all on the same
+#      binary scale) but the RA covariate columns are on a pts/100 scale (~90-120). Setting
+#      penalty = 0 for RA columns sidesteps this concern since glmnet does not apply the
+#      ridge penalty to unpenalized columns regardless of their scale.
+
+combined_lineups_adj <- rbind(
+  lineups_home_perspective %>%
+    rename('Lineup_team'   = 'Lineup_home',
+           'Lineup_opp'    = 'Lineup_away',
+           'LineupID_team' = 'LineupID'),
+  lineups_away_perspective %>%
+    rename('Lineup_team'   = 'Lineup_away',
+           'Lineup_opp'    = 'Lineup_home',
+           'LineupID_team' = 'LineupID')) %>%
+  left_join(LineupIDs, by = c('Lineup_opp' = 'Lineups')) %>%
+  rename('LineupID_opp' = 'LineupID') %>%
+  left_join(all_avgs %>% select(game_id, LineupID, ORTG_RA, DRTG_RA),
+            by = join_by(game_id == game_id, LineupID_team == LineupID)) %>%
+  rename('ORTG_RA_team' = 'ORTG_RA', 'DRTG_RA_team' = 'DRTG_RA') %>%
+  left_join(all_avgs %>% select(game_id, LineupID, ORTG_RA, DRTG_RA),
+            by = join_by(game_id == game_id, LineupID_opp == LineupID)) %>%
+  rename('ORTG_RA_opp' = 'ORTG_RA', 'DRTG_RA_opp' = 'DRTG_RA') %>%
+  filter(str_count(Lineup_team, ",") == 4,
+         str_count(Lineup_opp,  ",") == 4) %>%
+  separate_wider_delim(cols = Lineup_team, delim = ',',
+                       names = c('P1', 'P2', 'P3', 'P4', 'P5')) %>%
+  separate_wider_delim(cols = Lineup_opp, delim = ',',
+                       names = c('DP1', 'DP2', 'DP3', 'DP4', 'DP5')) %>%
+  mutate(across(P1:P5,   str_trim)) %>%
+  mutate(across(DP1:DP5, str_trim)) %>%
+  mutate(ORTG  = (100 / poss_team) * pts_team,
+         DRTG  = (100 / poss_opp)  * pts_opp,
+         netrt = ORTG - DRTG) %>%
+  filter(!is.na(netrt), !is.infinite(netrt)) %>%
+  filter(!is.na(ORTG_RA_team) & !is.na(DRTG_RA_team) &
+         !is.na(ORTG_RA_opp)  & !is.na(DRTG_RA_opp))
+
+set.seed(1)
+
+unique_players_adj <- unique(c(combined_lineups_adj$P1,  combined_lineups_adj$P2,
+                               combined_lineups_adj$P3,  combined_lineups_adj$P4,
+                               combined_lineups_adj$P5,  combined_lineups_adj$DP1,
+                               combined_lineups_adj$DP2, combined_lineups_adj$DP3,
+                               combined_lineups_adj$DP4, combined_lineups_adj$DP5))
+
+# Change 1: encode all 10 players per row — team as +1, opponents as -1.
+# Previously, Dhakshin's model only encoded P1:P5 in both the ORTG and DRTG models,
+# leaving DP1:DP5 as all-zero columns — meaning opponent players had no influence
+# on their own coefficient estimates despite appearing in unique_players.
+player_matrices_adj <- function(row, all_players) {
+  x <- rep(0, length(all_players))
+  x[which(all_players == row[1])]  <-  1
+  x[which(all_players == row[2])]  <-  1
+  x[which(all_players == row[3])]  <-  1
+  x[which(all_players == row[4])]  <-  1
+  x[which(all_players == row[5])]  <-  1
+  x[which(all_players == row[6])]  <- -1
+  x[which(all_players == row[7])]  <- -1
+  x[which(all_players == row[8])]  <- -1
+  x[which(all_players == row[9])]  <- -1
+  x[which(all_players == row[10])] <- -1
+  return(x)
+}
+
+# select(P1:DP5) gives columns in order P1,P2,P3,P4,P5,DP1,DP2,DP3,DP4,DP5
+# so row[1:5] are team players and row[6:10] are opponent players
+sample_adj <- t(apply(combined_lineups_adj %>% select(P1:DP5), 1,
+                      function(x) player_matrices_adj(x, unique_players_adj)))
+sample_adj <- as(as.matrix(sample_adj), 'dgCMatrix')
+
+# All four RA columns appended. Dhakshin's ORTG model used ORTG_RA_team + DRTG_RA_opp
+# and the DRTG model used ORTG_RA_opp + DRTG_RA_team. In a single net rating model
+# all four are relevant: team offensive history, team defensive history, opponent
+# offensive history, and opponent defensive history.
+sample_adj <- cbind(sample_adj,
+                    combined_lineups_adj$ORTG_RA_team,
+                    combined_lineups_adj$DRTG_RA_team,
+                    combined_lineups_adj$ORTG_RA_opp,
+                    combined_lineups_adj$DRTG_RA_opp)
+
+# RA covariate columns penalized the same as player columns (penalty = 1).
+# Change 3 (penalty = 0) was tested but reverted — see note at top of chunk.
+penalties_adj <- c(rep(1, ncol(sample_adj) - 4), rep(1, 4))
+
+# Change 2: weight each stint by the harmonic mean of possessions on both sides.
+# The harmonic mean penalises imbalanced stints (e.g. 1 offensive possession but 20
+# defensive) more than the arithmetic mean would. Without weighting, a 2-possession
+# stint where one team scores both times (ORTG = 200, netrt = +200) pulls on the
+# regression just as hard as a 40-possession stint, adding substantial noise.
+weights_adj <- (2 * combined_lineups_adj$poss_team * combined_lineups_adj$poss_opp) /
+               (combined_lineups_adj$poss_team + combined_lineups_adj$poss_opp)
+
+trial_adj <- cv.glmnet(sample_adj, combined_lineups_adj$netrt,
+                       alpha = 0, nfolds = 10, standardize = FALSE,
+                       penalty.factor = penalties_adj,
+                       weights = weights_adj)
+
+model_adj <- glmnet(sample_adj, combined_lineups_adj$netrt,
+                    alpha = 0, standardize = FALSE,
+                    lambda = trial_adj$lambda.min,
+                    penalty.factor = penalties_adj,
+                    weights = weights_adj)
+
+rapm_coefs <- as.matrix(model_adj$beta)
+n_players  <- length(unique_players_adj)
+
+# Rows 1:n_players are player coefficients; the final 4 rows are the RA covariates
+Rapm_adj <- data.frame(
+  "Player.Name" = unique_players_adj,
+  "RAPM"        = rapm_coefs[1:n_players, ]
+)
+Rapm_adj$rank <- dense_rank(desc(Rapm_adj$RAPM))
+
+# Inspect covariate coefficients to verify they are non-zero (unpenalized)
+covariate_coefs <- data.frame(
+  "Covariate"   = c('ORTG_RA_team', 'DRTG_RA_team', 'ORTG_RA_opp', 'DRTG_RA_opp'),
+  "Coefficient" = rapm_coefs[(n_players + 1):(n_players + 4), ]
+)
+print(covariate_coefs)
+
+saveRDS(Rapm_adj, "adjusted_rapm_24.rds")
+```
+
+### adjusted_new show results
+
+```{r}
+rapm_results_adj <- readRDS("adjusted_rapm_24.rds")
+
+rapm_results_adj %>%
+  arrange(rank) %>%
+  head(20)
+```
+
